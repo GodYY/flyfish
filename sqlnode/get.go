@@ -2,9 +2,11 @@ package sqlnode
 
 import (
 	"database/sql"
+	"fmt"
 	"github.com/jmoiron/sqlx"
 	"github.com/sniperHW/flyfish/errcode"
 	"github.com/sniperHW/flyfish/net"
+	"reflect"
 	"time"
 )
 import "github.com/sniperHW/flyfish/proto"
@@ -96,9 +98,12 @@ func (t *sqlTaskGet) do(db *sqlx.DB) (errCode int32, version int64, fields map[s
 	appendSingleSelectFieldsSqlStr(sqlStr, t.table, t.key, nil, queryFields)
 
 	s := sqlStr.ToString()
-	start := time.Now()
-	row := db.QueryRowx(s)
-	getLogger().Debugf("task-get: table(%s) key(%s): query:\"%s\" cost:%.3fs.", t.table, t.key, s, time.Now().Sub(start).Seconds())
+	//start := time.Now()
+	//row := db.QueryRowx(s)
+	//getLogger().Debugf("task-get: table(%s) key(%s): query:\"%s\" cost:%.3fs.", t.table, t.key, s, time.Now().Sub(start).Seconds())
+
+	ret := query(db.QueryRowx, s, "task-get: table(%s) key(%s): query:\"%s\"", t.table, t.key, s)
+	row := ret[0].Interface().(*sqlx.Row)
 
 	if err = row.Scan(queryFieldReceivers...); err == sql.ErrNoRows {
 		errCode = errcode.ERR_RECORD_NOTEXIST
@@ -243,4 +248,17 @@ func onGet(conn *cliConn, msg *net.Message) {
 	}
 
 	processCmd(cmd)
+}
+
+func query(f interface{}, sql string, format string, args ...interface{}) []reflect.Value {
+	fValue := reflect.ValueOf(f)
+
+	if true {
+		start := time.Now()
+		ret := fValue.Call([]reflect.Value{reflect.ValueOf(sql)})
+		getLogger().Debugln(fmt.Sprintf(format, args...) + fmt.Sprintf(" cost: %.3f seconds. ", time.Now().Sub(start).Seconds()))
+		return ret
+	} else {
+		return fValue.Call([]reflect.Value{reflect.ValueOf(sql)})
+	}
 }
