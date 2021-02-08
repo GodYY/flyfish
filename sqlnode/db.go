@@ -1,8 +1,11 @@
-package node_sql
+package sqlnode
 
 import (
 	"fmt"
 	"github.com/jmoiron/sqlx"
+
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/lib/pq"
 )
 
 func pgsqlOpen(host string, port int, dbname string, user string, password string) (*sqlx.DB, error) {
@@ -24,7 +27,7 @@ func dbOpen(sqlType string, host string, port int, dbname string, user string, p
 }
 
 func dbOpenByConfig() (*sqlx.DB, error) {
-	dbConfig := getNodeConfig().DBConfig
+	dbConfig := getConfig().DBConfig
 	return dbOpen(dbConfig.SqlType, dbConfig.ConfDbHost, dbConfig.ConfDbPort, dbConfig.ConfDataBase, dbConfig.ConfDbUser, dbConfig.ConfDbPassword)
 }
 
@@ -32,16 +35,17 @@ var (
 	globalDB *sqlx.DB
 )
 
-func initDB() error {
+func initDB() {
 	var err error
 	if globalDB, err = dbOpenByConfig(); err != nil {
-		return err
+		getLogger().Fatalf("init db: %s.", err)
 	}
 
-	conf := getNodeConfig()
+	conf := getConfig()
+	globalDB.SetMaxIdleConns(conf.DBConnections)
 	globalDB.SetMaxOpenConns(conf.DBConnections)
 
-	return nil
+	getLogger().Infoln("init db.")
 }
 
 func getGlobalDB() *sqlx.DB {

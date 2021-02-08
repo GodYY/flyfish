@@ -1,58 +1,60 @@
-package node_sql
+package sqlnode
 
 import (
-	"github.com/sniperHW/flyfish/codec/pb"
+	"fmt"
 	"github.com/sniperHW/flyfish/net"
+	"github.com/sniperHW/flyfish/net/pb"
 	"github.com/sniperHW/kendynet"
 	"sync"
 	"sync/atomic"
-	"teacher/node/common/config"
-	"teacher/node/common/logger"
 
 	protocol "github.com/sniperHW/flyfish/proto"
 )
 
 var (
-	listener    *net.Listener
-	clientCount int64
-	sessions    sync.Map
+	globalListener *net.Listener
+	clientCount    int64
+	sessions       sync.Map
 )
 
-func Start(conf *config.Config, idx int) error {
-	var err error
+func Start(cfgFilePath string) {
+	initConfig(cfgFilePath)
 
-	initConfig(conf, idx)
+	initLog()
 
-	if err := initDBMeta(); err != nil {
-		return err
-	}
-	logger.Logger().Infoln("load db-meta successfully.")
+	initDB()
+
+	initDBMeta()
 
 	initMessageHandler()
-	registerMessageHandlers()
-	initMessageRoutine()
 
-	if err := startListen(); err != nil {
-		return err
-	}
+	initCmdProcessor()
 
-	return nil
+	startListen()
 }
 
-func registerMessageHandlers() {
-	registerMessageHandler(uint16(protocol.CmdType_Get), get)
+func Stop() {
+	stopListen()
+
+	stopCmdProcessor()
+
+	sessions.Range(func(key, value interface{}) bool {
+		value.(kendynet.StreamSession).Close("shutdown", 0)
+		return true
+	})
+
 }
 
-func startListen() error {
+func startListen() {
 	var err error
 
-	config := getNodeConfig()
-	if listener, err = net.NewListener("tcp", config.ExternalAddr, verifyLogin); err != nil {
-		return err
+	config := getConfig()
+	if globalListener, err = net.NewListener("tcp", fmt.Sprintf("%s:%d", config.ServiceHost, config.ServicePort), verifyLogin); err != nil {
+		getLogger().Fatalf("start listen: %s.", err)
 	}
 
 	go func() {
-		err := listener.Serve(func(session kendynet.StreamSession, compress bool) {
+		err := globalListener.Serve(func(session kendynet.StreamSession, compress bool) {
 			go func() {
 				session.SetRecvTimeout(protocol.PingTime * 2)
 				session.SetSendQueueSize(10000)
@@ -72,21 +74,27 @@ func startListen() error {
 						dispatchMessage(session, msg.GetCmd(), msg)
 					}
 				}); err != nil {
-					logger.Errorf("session start error: %s", err)
+					getLogger().Errorf("session start: %s.", err)
 				}
 			}()
 		})
 
 		if err != nil {
-			logger.Logger().Errorf("serve error: %s\n", err.Error())
+			getLogger().Errorf("serve: %s.", err.Error())
 		}
 
-		logger.Infoln("listen stop.")
+		getLogger().Infoln("listen stop.")
 	}()
 
-	logger.Infof("start listen on %s.", config.ExternalAddr)
+	getLogger().Infof("start listen on %s:%d.", getConfig().ServiceHost, getConfig().ServicePort)
+}
 
-	return nil
+func stopListen() {
+	if globalListener != nil {
+		globalListener.Close()
+		globalListener = nil
+		getLogger().Infof("listen stop.")
+	}
 }
 
 func verifyLogin(loginReq *protocol.LoginReq) bool {
@@ -94,12 +102,16 @@ func verifyLogin(loginReq *protocol.LoginReq) bool {
 }
 
 func onNewSession(session kendynet.StreamSession) {
+	getLogger().Infof("client connected: remote-addr(%s).", session.RemoteAddr())
+
 	atomic.AddInt64(&clientCount, 1)
 	session.SetUserData(newCliConn(session))
 	sessions.Store(session, session)
 }
 
 func onSessionClosed(session kendynet.StreamSession, reason string) {
+	getLogger().Infof("client disconnected: remote-addr(%s) reason(%s).", session.RemoteAddr(), reason)
+
 	if u := session.GetUserData(); nil != u {
 		switch u.(type) {
 		case *cliConn:

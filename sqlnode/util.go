@@ -1,4 +1,4 @@
-package node_sql
+package sqlnode
 
 import "time"
 

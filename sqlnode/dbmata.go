@@ -1,4 +1,4 @@
-package node_sql
+package sqlnode
 
 import (
 	"fmt"
@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"teacher/node/common/logger"
 )
 
 type fieldConverter func(interface{}) interface{}
@@ -105,6 +104,14 @@ type fieldMeta struct {
 	defaultV interface{}     // 字段默认值
 }
 
+func (f *fieldMeta) getType() proto.ValueType {
+	return f.typ
+}
+
+func (f *fieldMeta) getDefaultV() interface{} {
+	return f.defaultV
+}
+
 func (f *fieldMeta) getReceiver() interface{} {
 	return getFieldGetterByType(f.typ)()
 }
@@ -117,7 +124,8 @@ const (
 	keyFieldName      = "__key__"
 	keyFieldIndex     = 0
 	versionFieldName  = "__version__"
-	versionFieldIndex = 1
+	versionFieldIndex = keyFieldIndex + 1
+	FirstFieldIndex   = versionFieldIndex + 1
 )
 
 var (
@@ -137,20 +145,43 @@ var (
 type tableMeta struct {
 	name               string                // 表名
 	fieldMetas         map[string]*fieldMeta // 字段meta
+	fieldInsertOrder   []string              // 字段插入排列
+	selectAllPrefix    string                // 查找记录所有字段前缀 "select allFieldNames... from table_name where keyFieldName="
+	insertPrefix       string                // 记录掺入前缀 "insert into table_name(cols...) VALUES("
 	allFieldNames      []string              // 包括'__key__'和'__version__'字段
 	allFieldGetters    []func() interface{}  //
 	allFieldConverters []fieldConverter      //
+}
+
+func (t *tableMeta) getName() string {
+	return t.name
 }
 
 func (t *tableMeta) getFieldMeta(field string) *fieldMeta {
 	return t.fieldMetas[field]
 }
 
+func (t *tableMeta) getFieldMetas() map[string]*fieldMeta {
+	return t.fieldMetas
+}
+
+func (t *tableMeta) getFieldInsertOrder() []string {
+	return t.fieldInsertOrder
+}
+
+func (t *tableMeta) getInsertPrefix() string {
+	return t.insertPrefix
+}
+
+func (t *tableMeta) getSelectAllPrefix() string {
+	return t.selectAllPrefix
+}
+
 func (t *tableMeta) getFieldCount() int {
 	return len(t.fieldMetas)
 }
 
-func (t *tableMeta) checkFields(fields []string) (bool, int) {
+func (t *tableMeta) checkFieldNames(fields []string) (bool, int) {
 	for i, v := range fields {
 		if t.fieldMetas[v] == nil {
 			return false, i
@@ -158,6 +189,22 @@ func (t *tableMeta) checkFields(fields []string) (bool, int) {
 	}
 
 	return true, 0
+}
+
+func (t *tableMeta) checkFields(fields []*proto.Field) (bool, int) {
+	for i, v := range fields {
+		fm := t.fieldMetas[v.GetName()]
+		if fm == nil || fm.getType() != v.GetType() {
+			return false, i
+		}
+	}
+
+	return true, 0
+}
+
+func (t *tableMeta) checkField(field *proto.Field) bool {
+	fm := t.fieldMetas[field.GetName()]
+	return fm != nil && fm.getType() == field.GetType()
 }
 
 func (t *tableMeta) getAllFields() []string {
@@ -203,26 +250,26 @@ type tableDef struct {
 }
 
 var (
-	db_meta *dbMeta
+	globalDBMeta *dbMeta
 )
 
-func initDBMeta() error {
+func initDBMeta() {
 	tableDef, err := loadTableDef()
 	if err != nil {
-		return err
+		getLogger().Fatalf("init db-meta: load table def: %s.", err)
 	}
 
 	tableMetas, err := createTableMetasByTableDef(tableDef)
 	if err != nil {
-		return err
+		getLogger().Fatalf("init db-meta: create table meta: %s.", err)
 	}
 
-	db_meta = &dbMeta{
+	globalDBMeta = &dbMeta{
 		version: 0,
 	}
-	db_meta.tableMetas.Store(tableMetas)
+	globalDBMeta.tableMetas.Store(tableMetas)
 
-	return nil
+	getLogger().Infoln("init de-meta.")
 }
 
 func createTableMetasByTableDef(def []*tableDef) (map[string]*tableMeta, error) {
@@ -238,7 +285,8 @@ func createTableMetasByTableDef(def []*tableDef) (map[string]*tableMeta, error) 
 		allFieldCount := fieldCount + 2
 		tMeta := &tableMeta{
 			name:               t.name,
-			fieldMetas:         make(map[string]*fieldMeta, len(fieldDefStr)),
+			fieldMetas:         make(map[string]*fieldMeta, fieldCount),
+			fieldInsertOrder:   make([]string, fieldCount),
 			allFieldNames:      make([]string, allFieldCount),
 			allFieldGetters:    make([]func() interface{}, allFieldCount),
 			allFieldConverters: make([]fieldConverter, allFieldCount),
@@ -253,7 +301,7 @@ func createTableMetasByTableDef(def []*tableDef) (map[string]*tableMeta, error) 
 		tMeta.allFieldConverters[versionFieldIndex] = getFieldConverterByType(versionFieldMeta.typ)
 
 		var (
-			allFieldIndex = 2
+			allFieldIndex = FirstFieldIndex
 			fieldName     string
 			fieldType     proto.ValueType
 			fieldDefaultV interface{}
@@ -268,7 +316,7 @@ func createTableMetasByTableDef(def []*tableDef) (map[string]*tableMeta, error) 
 
 			fieldName = s[0]
 
-			if fieldName == "" || fieldName == keyFieldMeta.name || fieldName == versionFieldMeta.name {
+			if fieldName == "" || fieldName == keyFieldName || fieldName == versionFieldName {
 				return nil, fmt.Errorf("%s: field %dth '%s': name invalid", t.name, i, v)
 			}
 
@@ -290,12 +338,15 @@ func createTableMetasByTableDef(def []*tableDef) (map[string]*tableMeta, error) 
 				defaultV: fieldDefaultV,
 			}
 
+			tMeta.fieldInsertOrder[i] = fieldName
 			tMeta.allFieldNames[allFieldIndex] = fieldName
 			tMeta.allFieldGetters[allFieldIndex] = getFieldGetterByType(fieldType)
 			tMeta.allFieldConverters[allFieldIndex] = getFieldConverterByType(fieldType)
 			allFieldIndex++
 		}
 
+		tMeta.insertPrefix = fmt.Sprintf("INSERT INTO %s(%s,%s,%s) VALUES(", t.name, keyFieldName, versionFieldName, strings.Join(tMeta.fieldInsertOrder, ","))
+		tMeta.selectAllPrefix = fmt.Sprintf("SELECT %s FROM %s WHERE ", strings.Join(tMeta.allFieldNames, ","), t.name)
 		tableMetas[tMeta.name] = tMeta
 	}
 
@@ -305,9 +356,8 @@ func createTableMetasByTableDef(def []*tableDef) (map[string]*tableMeta, error) 
 func loadTableDef() ([]*tableDef, error) {
 	var db *sqlx.DB
 	var err error
-	dbConfig := getNodeConfig().DBConfig
 
-	db, err = dbOpen(dbConfig.SqlType, dbConfig.ConfDbHost, dbConfig.ConfDbPort, dbConfig.ConfDataBase, dbConfig.ConfDbUser, dbConfig.ConfDbPassword)
+	db, err = dbOpenByConfig()
 
 	if nil != err {
 		return nil, err
@@ -336,7 +386,7 @@ func loadTableDef() ([]*tableDef, error) {
 	}
 }
 
-func reloadTableMeta(cli *cliConn, msg *net.Message) {
+func onReloadTableConf(cli *cliConn, msg *net.Message) {
 	head := msg.GetHead()
 
 	var (
@@ -347,15 +397,15 @@ func reloadTableMeta(cli *cliConn, msg *net.Message) {
 	)
 
 	if tableDef, err = loadTableDef(); err != nil {
-		resp.Err = fmt.Sprintf("load table-def failed: %s", err)
-		logger.Logger().Errorln(resp.Err)
+		resp.Err = fmt.Sprintf("load table-def: %s", err)
+		getLogger().Errorf(resp.Err)
 		head.ErrCode = errcode.ERR_OTHER
 	} else if tableMetas, err = createTableMetasByTableDef(tableDef); err != nil {
-		resp.Err = fmt.Sprintf("create table-meta failed: %s", err)
-		logger.Logger().Errorln(resp.Err)
+		resp.Err = fmt.Sprintf("create table-meta: %s", err)
+		getLogger().Errorln(resp.Err)
 		head.ErrCode = errcode.ERR_OTHER
 	} else {
-		db_meta.setTableMetas(tableMetas)
+		globalDBMeta.setTableMetas(tableMetas)
 		head.ErrCode = errcode.ERR_OK
 	}
 
@@ -363,5 +413,5 @@ func reloadTableMeta(cli *cliConn, msg *net.Message) {
 }
 
 func getDBMeta() *dbMeta {
-	return db_meta
+	return globalDBMeta
 }
